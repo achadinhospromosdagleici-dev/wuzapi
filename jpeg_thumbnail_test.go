@@ -42,3 +42,11 @@ func TestJpegThumbnail(t *testing.T) {
 		t.Errorf("thumbnail %dx%d exceeds the 72x72 bound", cfg.Width, cfg.Height)
 	}
 }
+
+// TestJpegThumbnailNil verifies the nil-image guard returns an error instead of
+// panicking (resize.Thumbnail dereferences the image's bounds).
+func TestJpegThumbnailNil(t *testing.T) {
+	if _, err := jpegThumbnail(nil, 72, 72); err == nil {
+		t.Error("expected an error for a nil image, got nil")
+	}
+}

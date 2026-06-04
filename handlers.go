@@ -1213,6 +1213,9 @@ func (s *server) SendAudio() http.HandlerFunc {
 // ratio) and returns it JPEG-encoded. It encodes in memory, so there is no temp
 // file to leak.
 func jpegThumbnail(img image.Image, width, height uint) ([]byte, error) {
+	if img == nil {
+		return nil, errors.New("cannot create thumbnail from a nil image")
+	}
 	thumb := resize.Thumbnail(width, height, img, resize.Lanczos3)
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, thumb, nil); err != nil {
