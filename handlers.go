@@ -216,6 +216,39 @@ func (s *server) authalice(next http.Handler) http.Handler {
 	})
 }
 
+// resolveConnectEvents decides which event-subscription string to persist when
+// a client (re)connects. With no subscribe list the existing subscriptions are
+// preserved instead of being overwritten with an empty value (issue #305);
+// changed reports whether the stored value needs updating.
+func resolveConnectEvents(subscribe []string, existing string) (eventstring string, changed bool) {
+	if len(subscribe) < 1 {
+		return existing, false
+	}
+	var subscribedEvents []string
+	for _, arg := range subscribe {
+		if !Find(supportedEventTypes, arg) {
+			log.Warn().Str("Type", arg).Msg("Event type discarded")
+			continue
+		}
+		if !Find(subscribedEvents, arg) {
+			subscribedEvents = append(subscribedEvents, arg)
+		}
+	}
+	resolved := strings.Join(subscribedEvents, ",")
+	return resolved, resolved != existing
+}
+
+// setDisconnectedState marks a user disconnected. Event subscriptions are kept
+// by default and only reset when clearEvents is true (issue #305).
+func (s *server) setDisconnectedState(txtid string, clearEvents bool) error {
+	if clearEvents {
+		_, err := s.db.Exec("UPDATE users SET connected=0,events=$1 WHERE id=$2", "", txtid)
+		return err
+	}
+	_, err := s.db.Exec("UPDATE users SET connected=0 WHERE id=$1", txtid)
+	return err
+}
+
 // Connects to Whatsapp Servers
 func (s *server) Connect() http.HandlerFunc {
 
@@ -249,30 +282,22 @@ func (s *server) Connect() http.HandlerFunc {
 			}
 		}
 
-		var subscribedEvents []string
-		if len(t.Subscribe) < 1 {
-			if !Find(subscribedEvents, "") {
-				subscribedEvents = append(subscribedEvents, "")
+		// Resolve which events to subscribe. With no subscribe list, preserve the
+		// user's existing subscriptions instead of overwriting them (issue #305).
+		existingEvents := r.Context().Value("userinfo").(Values).Get("Events")
+		var changed bool
+		eventstring, changed = resolveConnectEvents(t.Subscribe, existingEvents)
+		if changed {
+			if _, err = s.db.Exec("UPDATE users SET events=$1 WHERE id=$2", eventstring, txtid); err != nil {
+				log.Warn().Msg("Could not set events in users table")
+			} else {
+				log.Info().Str("events", eventstring).Msg("Setting subscribed events")
+				v := updateUserInfo(r.Context().Value("userinfo"), "Events", eventstring)
+				userinfocache.Set(token, v, cache.NoExpiration)
 			}
 		} else {
-			for _, arg := range t.Subscribe {
-				if !Find(supportedEventTypes, arg) {
-					log.Warn().Str("Type", arg).Msg("Event type discarded")
-					continue
-				}
-				if !Find(subscribedEvents, arg) {
-					subscribedEvents = append(subscribedEvents, arg)
-				}
-			}
+			log.Info().Str("events", eventstring).Msg("Preserving existing subscribed events")
 		}
-		eventstring = strings.Join(subscribedEvents, ",")
-		_, err = s.db.Exec("UPDATE users SET events=$1 WHERE id=$2", eventstring, txtid)
-		if err != nil {
-			log.Warn().Msg("Could not set events in users table")
-		}
-		log.Info().Str("events", eventstring).Msg("Setting subscribed events")
-		v := updateUserInfo(r.Context().Value("userinfo"), "Events", eventstring)
-		userinfocache.Set(token, v, cache.NoExpiration)
 
 		log.Info().Str("jid", jid).Msg("Attempt to connect")
 		kill := make(chan bool, 1)
@@ -321,13 +346,18 @@ func (s *server) Disconnect() http.HandlerFunc {
 		if clientManager.GetWhatsmeowClient(txtid).IsConnected() == true {
 			//if clientManager.GetWhatsmeowClient(txtid).IsLoggedIn() == true {
 			log.Info().Str("jid", jid).Msg("Disconnection successfull")
-			_, err := s.db.Exec("UPDATE users SET connected=0,events=$1 WHERE id=$2", "", txtid)
-			if err != nil {
-				log.Warn().Str("txtid", txtid).Msg("Could not set events in users table")
+			// Preserve event subscriptions by default; pass ?clear=true to also
+			// reset them on disconnect (issue #305).
+			clearEvents := r.URL.Query().Get("clear") == "true"
+			if err := s.setDisconnectedState(txtid, clearEvents); err != nil {
+				log.Warn().Str("txtid", txtid).Msg("Could not update users table on disconnect")
+			} else {
+				log.Info().Str("txtid", txtid).Bool("clearedEvents", clearEvents).Msg("Update DB on disconnection")
+				if clearEvents {
+					v := updateUserInfo(r.Context().Value("userinfo"), "Events", "")
+					userinfocache.Set(token, v, cache.NoExpiration)
+				}
 			}
-			log.Info().Str("txtid", txtid).Msg("Update DB on disconnection")
-			v := updateUserInfo(r.Context().Value("userinfo"), "Events", "")
-			userinfocache.Set(token, v, cache.NoExpiration)
 
 			response := map[string]interface{}{"Details": "Disconnected"}
 			responseJson, err := json.Marshal(response)
