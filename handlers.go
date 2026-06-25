@@ -767,11 +767,14 @@ func (s *server) GetStatus() http.HandlerFunc {
 		isLoggedIn := clientManager.GetWhatsmeowClient(txtid).IsLoggedIn()
 
 		var proxyURL string
-		var webhookUseProxy bool
-		s.db.QueryRow(
+		webhookUseProxy := *globalWebhookUseProxy
+		err := s.db.QueryRow(
 			"SELECT proxy_url, COALESCE(webhook_use_proxy, true) FROM users WHERE id = $1",
 			txtid,
 		).Scan(&proxyURL, &webhookUseProxy)
+		if err != nil && err != sql.ErrNoRows {
+			log.Warn().Err(err).Str("user_id", txtid).Msg("Failed to query proxy settings for user")
+		}
 		proxyConfig := proxyConfigResponse(proxyURL, webhookUseProxy)
 
 		var s3Enabled bool
@@ -791,7 +794,7 @@ func (s *server) GetStatus() http.HandlerFunc {
 			"media_delivery": "",
 			"retention_days": 0,
 		}
-		err := s.db.QueryRow(`SELECT COALESCE(s3_enabled, false), COALESCE(s3_endpoint, ''), COALESCE(s3_region, ''), COALESCE(s3_bucket, ''), COALESCE(s3_path_style, false), COALESCE(s3_public_url, ''), COALESCE(media_delivery, ''), COALESCE(s3_retention_days, 0) FROM users WHERE id = $1`, txtid).Scan(&s3Enabled, &s3Endpoint, &s3Region, &s3Bucket, &s3PathStyle, &s3PublicURL, &s3MediaDelivery, &s3RetentionDays)
+		err = s.db.QueryRow(`SELECT COALESCE(s3_enabled, false), COALESCE(s3_endpoint, ''), COALESCE(s3_region, ''), COALESCE(s3_bucket, ''), COALESCE(s3_path_style, false), COALESCE(s3_public_url, ''), COALESCE(media_delivery, ''), COALESCE(s3_retention_days, 0) FROM users WHERE id = $1`, txtid).Scan(&s3Enabled, &s3Endpoint, &s3Region, &s3Bucket, &s3PathStyle, &s3PublicURL, &s3MediaDelivery, &s3RetentionDays)
 
 		if err == nil {
 			// Overwrite defaults with actual values if the query succeeded
@@ -5226,17 +5229,18 @@ func (s *server) ListNewsletter() http.HandlerFunc {
 // Admin List users
 func (s *server) ListUsers() http.HandlerFunc {
 	type usersStruct struct {
-		Id         string         `db:"id"`
-		Name       string         `db:"name"`
-		Token      string         `db:"token"`
-		Webhook    string         `db:"webhook"`
-		Jid        string         `db:"jid"`
-		Qrcode     string         `db:"qrcode"`
-		Connected  sql.NullBool   `db:"connected"`
-		Expiration sql.NullInt64  `db:"expiration"`
-		ProxyURL   sql.NullString `db:"proxy_url"`
-		Events     string         `db:"events"`
-		History    sql.NullInt64  `db:"history"`
+		Id              string         `db:"id"`
+		Name            string         `db:"name"`
+		Token           string         `db:"token"`
+		Webhook         string         `db:"webhook"`
+		Jid             string         `db:"jid"`
+		Qrcode          string         `db:"qrcode"`
+		Connected       sql.NullBool   `db:"connected"`
+		Expiration      sql.NullInt64  `db:"expiration"`
+		ProxyURL        sql.NullString `db:"proxy_url"`
+		WebhookUseProxy bool           `db:"webhook_use_proxy"`
+		Events          string         `db:"events"`
+		History         sql.NullInt64  `db:"history"`
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		vars := mux.Vars(r)
@@ -5247,11 +5251,11 @@ func (s *server) ListUsers() http.HandlerFunc {
 
 		if hasID {
 			// Fetch a single user
-			query = "SELECT id, name, token, webhook, jid, qrcode, connected, expiration, proxy_url, events, history FROM users WHERE id = $1"
+			query = "SELECT id, name, token, webhook, jid, qrcode, connected, expiration, proxy_url, COALESCE(webhook_use_proxy, true) AS webhook_use_proxy, events, history FROM users WHERE id = $1"
 			args = append(args, userID)
 		} else {
 			// Fetch all users
-			query = "SELECT id, name, token, webhook, jid, qrcode, connected, expiration, proxy_url, events, history FROM users"
+			query = "SELECT id, name, token, webhook, jid, qrcode, connected, expiration, proxy_url, COALESCE(webhook_use_proxy, true) AS webhook_use_proxy, events, history FROM users"
 		}
 
 		rows, err := s.db.Queryx(query, args...)
@@ -5296,16 +5300,7 @@ func (s *server) ListUsers() http.HandlerFunc {
 			}
 			// Add proxy_config
 			proxyURL := user.ProxyURL.String
-			var webhookUseProxy bool
-			err = s.db.QueryRow(
-				"SELECT COALESCE(webhook_use_proxy, true) FROM users WHERE id = $1",
-				user.Id,
-			).Scan(&webhookUseProxy)
-			if err != nil && err != sql.ErrNoRows {
-				log.Warn().Err(err).Str("user_id", user.Id).Msg("Failed to query webhook_use_proxy for user")
-				webhookUseProxy = *globalWebhookUseProxy
-			}
-			userMap["proxy_config"] = proxyConfigResponse(proxyURL, webhookUseProxy)
+			userMap["proxy_config"] = proxyConfigResponse(proxyURL, user.WebhookUseProxy)
 			// Add s3_config (search S3 fields in the database)
 			var s3Enabled bool
 			var s3Endpoint, s3Region, s3Bucket, s3PublicURL, s3MediaDelivery string
@@ -6131,13 +6126,25 @@ func (s *server) SetProxy() http.HandlerFunc {
 		}
 
 		// Store proxy configuration in database
-		webhookUseProxy := resolveWebhookUseProxy(t.WebhookUseProxy)
-		_, err = s.db.Exec(
-			"UPDATE users SET proxy_url = $1, webhook_use_proxy = $2 WHERE id = $3",
-			t.ProxyURL,
-			webhookUseProxy,
-			txtid,
-		)
+		var webhookUseProxy bool
+		if t.WebhookUseProxy != nil {
+			webhookUseProxy = *t.WebhookUseProxy
+			_, err = s.db.Exec(
+				"UPDATE users SET proxy_url = $1, webhook_use_proxy = $2 WHERE id = $3",
+				t.ProxyURL,
+				webhookUseProxy,
+				txtid,
+			)
+		} else {
+			err = s.db.QueryRow(
+				"SELECT COALESCE(webhook_use_proxy, true) FROM users WHERE id = $1",
+				txtid,
+			).Scan(&webhookUseProxy)
+			if err != nil {
+				webhookUseProxy = *globalWebhookUseProxy
+			}
+			_, err = s.db.Exec("UPDATE users SET proxy_url = $1 WHERE id = $2", t.ProxyURL, txtid)
+		}
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New("failed to save proxy configuration"))
 			return

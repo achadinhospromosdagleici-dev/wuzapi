@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -471,11 +472,14 @@ func (s *server) startClient(userID string, textjid string, token string, kill c
 	})
 
 	var proxyURL string
-	var webhookUseProxy bool
+	webhookUseProxy := *globalWebhookUseProxy
 	err = s.db.QueryRow(
 		"SELECT proxy_url, COALESCE(webhook_use_proxy, true) FROM users WHERE id=$1",
 		userID,
 	).Scan(&proxyURL, &webhookUseProxy)
+	if err != nil && err != sql.ErrNoRows {
+		log.Error().Err(err).Str("user_id", userID).Msg("Failed to query proxy settings from database")
+	}
 	if err == nil && proxyURL != "" {
 		parsed, perr := url.Parse(proxyURL)
 		if perr != nil {
